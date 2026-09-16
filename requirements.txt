@@ -1,4 +1,29 @@
+# LangChain / LangGraph
 langgraph
 langchain
 langchain-openai
+langchain-core
+langchain-mcp-adapters
+
+# Config
 python-dotenv
+
+# API
+fastapi
+uvicorn
+
+# Integrations
+PyGithub
+jira
+
+# Memory
+chromadb
+
+# MCP 
+mcp
+
+# Observability 
+langsmith
+
+# Utilities
+pydantic
