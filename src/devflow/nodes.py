@@ -1,6 +1,6 @@
 from .state import DevFlowState
-import json
-import re
+import json, re 
+from .logging_utils import node_timer, log_event
 from .integrations.github_adapter import GitHubAdapter
 from .token_utils import clip
 from .memory import store_memory
@@ -250,32 +250,6 @@ def pdf_extractor_node(state: DevFlowState) -> dict:
             "completed_agents": completed + ["pdf_extractor_node"]
         }
 
-def llm_agent_node(state: DevFlowState) -> dict:
-    messages = state.get("messages", [])
-
-    system_prompt = """You are a helpful coding assistant.
-        Use the available tools only when needed.
-        Once you have the information from tools, give a clear final answer.
-        Do not call tools repeatedly without reason."""
-
-    if not messages:
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=state["user_request"])
-        ]
-
-    print("\n=== INPUT TO LLM ===")
-    print(messages)
-
-    response = llm_with_tools.invoke(messages)
-
-    print("\n=== LLM TOOL CALLS ===")
-    print(response.tool_calls)
-
-    return {
-        "messages": [response]
-    }
-
 
 def implementation_node(state: DevFlowState) -> dict:
 
@@ -284,165 +258,218 @@ def implementation_node(state: DevFlowState) -> dict:
     architecture_raw = state.get("architecture", "")
 
     previous_plan = clip(state.get("implementation_plan", ""), 4000)
-    revision_feedback = clip(state.get("review_feedback", ""), 1800)
+    revision_feedback = clip(state.get("review_feedback", ""), 4000)
 
     completed = state.get("completed_agents", [])
     revision_count = state.get("revision_count", 0)
+    thread_id = state.get("thread_id")
+    with node_timer("implementation_node", thread_id=thread_id):
 
-    full_context = (
-        f"REQUEST:\n{user_request_raw}\n\nREQUIREMENTS:\n{requirement_raw}\n"
-        f"\nARCHITECTURE:\n{architecture_raw}\n\nATTEMPT: {revision_count + 1}"
-    )
-    if revision_count and previous_plan:
-        full_context += f"\n\nPREVIOUS PLAN (preserve valid work):\n{previous_plan}"
-    if revision_feedback:
-        full_context += f"\n\n{revision_feedback}"
+        full_context = (
+            f"REQUEST:\n{user_request_raw}\n\nREQUIREMENTS:\n{requirement_raw}\n"
+            f"\nARCHITECTURE:\n{architecture_raw}\n\nATTEMPT: {revision_count + 1}"
+        )
+        if revision_count and previous_plan:
+            full_context += f"\n\nPREVIOUS PLAN (preserve valid work):\n{previous_plan}"
+        if revision_feedback:
+            full_context += f"\n\n{revision_feedback}"
 
-    formatted_prompt = IMPLEMENTATION_PROMPT_TEMPLATE.format(
-        user_message=full_context
-    )
+        formatted_prompt = IMPLEMENTATION_PROMPT_TEMPLATE.format(
+            user_message=full_context
+        )
 
-    result = implementation_llm.invoke(formatted_prompt)
+        result = implementation_llm.invoke(formatted_prompt)
 
-    plan_json = result.model_dump_json(indent=2)
+        plan_json = result.model_dump_json(indent=2)
 
-    return {
-        "implementation_plan": plan_json,
-        # These artifacts describe the previous plan and must never be reviewed
-        # as if they belonged to the newly generated revision.
-        "testing_plan": "",
-        "security_review": "",
-        "code_review": "",
-        "approval_status": "",
-        "approval_feedback": "",
-        "applied_review_feedback": revision_feedback,
-        "review_feedback": "",
-        "completed_agents": completed + ["implementation_node"],
-        "revision_count": revision_count + 1
-    }
+        log_event(
+            "implementation_summary",
+            thread_id=thread_id,
+            overall_risk=getattr(result, "overall_risk", None),
+        )
+
+        return {
+            "implementation_plan": plan_json,
+            "approval_status": "",
+            "approval_feedback": "",
+            "applied_review_feedback": revision_feedback,
+            "review_feedback": "",
+            "completed_agents": completed + ["implementation_node"],
+            "revision_count": revision_count + 1
+        }
 
 def testing_node(state: DevFlowState) -> dict:
 
-    implementation_plan_raw = clip(state.get("implementation_plan", ""), 1500)
+    implementation_plan_raw = clip(state.get("implementation_plan", ""), 4000)
     completed = state["completed_agents"]
+    thread_id = state.get("thread_id")
+    with node_timer("testing_node", thread_id=thread_id):
+        formatted_prompt = TESTING_PROMPT_TEMPLATE.format(
+            implementation_plan=implementation_plan_raw
+        )
 
-    formatted_prompt = TESTING_PROMPT_TEMPLATE.format(
-        implementation_plan=implementation_plan_raw
-    )
+        result = testing_llm.invoke(formatted_prompt)
 
-    result = testing_llm.invoke(formatted_prompt)
+        plan_json = result.model_dump_json(indent=2)
 
-    plan_json = result.model_dump_json(indent=2)
+        log_event(
+            "testing_summary",
+            thread_id=thread_id,
+            overall_risk=getattr(result, "overall_risk", None),
+        )
 
-    return {
-        "testing_plan": plan_json,
-        "completed_agents": completed + ["testing_node"]
-    }
+        return {
+            "testing_plan": plan_json,
+            "completed_agents": completed + ["testing_node"]
+        }
 
 def security_node(state: DevFlowState) -> dict:
 
-    implementation_plan_raw = clip(state.get("implementation_plan", ""), 1500)
+    implementation_plan_raw = clip(state.get("implementation_plan", ""), 4000)
     completed = state["completed_agents"]
+    thread_id = state.get("thread_id")
+    with node_timer("security_node", thread_id=thread_id):
+        formatted_prompt = SECURITY_PROMPT_TEMPLATE.format(
+            implementation_plan=implementation_plan_raw
+        )
 
-    formatted_prompt = SECURITY_PROMPT_TEMPLATE.format(
-        implementation_plan=implementation_plan_raw
-    )
+        result = structured_security_llm.invoke(formatted_prompt)
 
-    result = structured_security_llm.invoke(formatted_prompt)
+        plan_json = result.model_dump_json(indent=2)
 
-    plan_json = result.model_dump_json(indent=2)
+        log_event(
+            "security_summary",
+            thread_id=thread_id,
+            overall_risk=getattr(result, "overall_risk", None),
+        )
 
-    return {
-        "security_review": plan_json,
-        "completed_agents": completed + ["security_node"]
-    }
+        return {
+            "security_review": plan_json,
+            "completed_agents": completed + ["security_node"]
+        }
 
 def code_review_node(state: DevFlowState) -> dict:
-    implementation_plan_raw = clip(state.get("implementation_plan", ""), 1500)
-    testing_plan_raw = clip(state.get("testing_plan", ""), 1500)
-    security_review_raw = clip(state.get("security_review", ""), 1500)
+    implementation_plan_raw = clip(state.get("implementation_plan", ""), 4000)
+    testing_plan_raw = clip(state.get("testing_plan", ""), 4000)
+    security_review_raw = clip(state.get("security_review", ""), 4000)
     previous_feedback = state.get("applied_review_feedback", "") or "None"
     revision_count = state.get("revision_count", 0)
     completed = state.get("completed_agents", [])
+    thread_id = state.get("thread_id")
+    with node_timer("code_review_node", thread_id=thread_id):
 
-    formatted_prompt = CODE_REVIEW_PROMPT_TEMPLATE.format(
-        implementation_plan=implementation_plan_raw,
-        testing_plan=testing_plan_raw,
-        security_review=security_review_raw,
-        previous_feedback=previous_feedback,
-        revision_count=revision_count,
-    )
+        formatted_prompt = CODE_REVIEW_PROMPT_TEMPLATE.format(
+            implementation_plan=implementation_plan_raw,
+            testing_plan=testing_plan_raw,
+            security_review=security_review_raw,
+            previous_feedback=previous_feedback,
+            revision_count=revision_count,
+        )
 
-    result = structured_code_review_llm.invoke(formatted_prompt)
+        result = structured_code_review_llm.invoke(formatted_prompt)
 
-    plan_json = result.model_dump_json(indent=2)
-    review_data = result.model_dump()
-    review_feedback = ""
-    if review_data.get("recommendation", "").strip().lower() == "request_changes":
-        review_feedback = format_review_feedback(review_data, revision_count)
+        plan_json = result.model_dump_json(indent=2)
+        review_data = result.model_dump()
+        review_feedback = ""
+        if review_data.get("recommendation", "").strip().lower() == "request_changes":
+            review_feedback = format_review_feedback(review_data, revision_count)
+        
+        log_event(
+            "code_review_summary",
+            thread_id=thread_id,
+            overall_risk=getattr(result, "overall_risk", None),
+        )
 
-    return {
-        "code_review": plan_json,
-        "review_feedback": review_feedback,
-        "applied_review_feedback": "",
-        "completed_agents": completed + ["code_review_node"],
-    }
+        return {
+            "code_review": plan_json,
+            "review_feedback": review_feedback,
+            "completed_agents": completed + ["code_review_node"],
+        }
 
 def human_approval_node(state: DevFlowState) -> dict:
     """Map the structured review recommendation to workflow approval state."""
     code_review = state.get("code_review", "")
     completed = state.get("completed_agents", [])
+    thread_id = state.get("thread_id") or state.get("user_request", "")[:40]
 
-    if state.get("force_approve", False):
-        return {
-            "approval_status": "approved",
-            "approval_feedback": "Approval was explicitly forced by the caller.",
-            "completed_agents": completed + ["human_approval_node"],
-        }
+    with node_timer("human_approval_node", thread_id=thread_id):  # Fix timer label
 
-    try:
-        code_review_data = json.loads(code_review)
-        recommendation = code_review_data.get("recommendation", "").strip().lower()
-        summary = code_review_data.get("summary", "")
-        feedback = state.get("review_feedback", "") or summary
-    
-        # 3. Status Mapping Logic
-        if recommendation == "approve":
+        if state.get("force_approve", False):
             approval_status = "approved"
-            feedback = "Plan approved automatically by system review."
-        elif recommendation == "request_changes":
-            if state.get("revision_count", 0) >= MAX_REVISION_ATTEMPTS:
-                feedback = f"Maximum of {MAX_REVISION_ATTEMPTS} implementation attempts reached. Outstanding feedback:\n{feedback or summary}"
-                return {
-                    "approval_status": "max_revisions_reached",
-                    "approval_feedback": feedback,
-                    "final_response": feedback,
-                    "completed_agents": completed + ["human_approval_node"],
-                }
-            else:
-                approval_status = "rejected"
-                feedback = f"Changes requested:\n{feedback or summary}"
-        else:  # needs_discussion or fallback
-            approval_status = "pending"
-            feedback = f"Manual discussion required:\n{feedback or 'No review rationale was provided.'}"
+            feedback = "Approval was explicitly forced by the caller."
+            
+            # Log event for forced approval
+            log_event(
+                "human_approval_summary",
+                thread_id=thread_id,
+                approval_status=approval_status,
+                recommendation="forced",
+                forced=True,
+            )
 
-        return {
-            "approval_status": approval_status,
-            "approval_feedback": feedback,
-            "completed_agents": completed + ["human_approval_node"],
-        }
-    except json.JSONDecodeError:
-        return {
-            "approval_status": "pending",
-            "approval_feedback": "Invalid JSON in code review. Manual review required.",
-            "completed_agents": completed + ["human_approval_node"],
-        }
+            return {
+                "approval_status": approval_status,
+                "approval_feedback": feedback,
+                "completed_agents": completed + ["human_approval_node"],
+            }
 
+        try:
+            code_review_data = json.loads(code_review)
+            recommendation = code_review_data.get("recommendation", "").strip().lower()
+            summary = code_review_data.get("summary", "")
+            feedback = state.get("review_feedback", "") or summary
+        
+            # Status Mapping Logic
+            if recommendation == "approve":
+                approval_status = "approved"
+                feedback = "Plan approved automatically by system review."
+            elif recommendation == "request_changes":
+                if state.get("revision_count", 0) >= MAX_REVISION_ATTEMPTS:
+                    approval_status = "max_revisions_reached"
+                    feedback = f"Maximum of {MAX_REVISION_ATTEMPTS} implementation attempts reached. Outstanding feedback:\n{feedback or summary}"
+                else:
+                    approval_status = "rejected"
+                    feedback = f"Changes requested:\n{feedback or summary}"
+            else:  # needs_discussion or fallback
+                approval_status = "pending"
+                feedback = f"Manual discussion required:\n{feedback or 'No review rationale was provided.'}"
+
+            # Log event here before returning
+            log_event(
+                "human_approval_summary",
+                thread_id=thread_id,
+                approval_status=approval_status,
+                recommendation=recommendation,
+                revision_count=state.get("revision_count", 0),
+            )
+
+            res_dict = {
+                "approval_status": approval_status,
+                "approval_feedback": feedback,
+                "completed_agents": completed + ["human_approval_node"],
+            }
+            if approval_status == "max_revisions_reached":
+                res_dict["final_response"] = feedback
+
+            return res_dict
+
+        except json.JSONDecodeError:
+            log_event(
+                "human_approval_summary",
+                thread_id=thread_id,
+                approval_status="pending",
+                error="Invalid JSON in code review",
+            )
+            return {
+                "approval_status": "pending",
+                "approval_feedback": "Invalid JSON in code review. Manual review required.",
+                "completed_agents": completed + ["human_approval_node"],
+            }
 def code_generation_node(state: DevFlowState) -> dict:
     """Generate code from the approved implementation plan."""
     requirement_raw = state.get("requirement", "")
     implementation_plan = clip(state.get("implementation_plan", ""), 4000)
-    security_review = clip(state.get("security_review", ""), 1800)
+    security_review = clip(state.get("security_review", ""), 4000)
     completed = state.get("completed_agents", [])
 
     formatted_prompt = CODE_GENERATION_PROMPT_TEMPLATE.format(
@@ -464,6 +491,7 @@ def slugify(text: str) -> str:
     text = re.sub(r'[^a-z0-9\s-]', '', text)
     return re.sub(r'[\s_]+', '-', text).strip('-')[:30]
 
+
 def git_automation_node(state: DevFlowState) -> dict:
     """Create a GitHub branch and pull request for approved output."""
 
@@ -472,133 +500,149 @@ def git_automation_node(state: DevFlowState) -> dict:
     approval_status = state.get("approval_status", "")
     approval_feedback = state.get("approval_feedback", "")
     completed = state.get("completed_agents", [])
+    thread_id = state.get("thread_id") or user_request_raw[:40]
 
     git_result = "Skipped"
     pr_result = "N/A"
     commit_results = []
+    branch_name = None
 
-    if approval_status == "approved":
+    with node_timer("git_automation_node", thread_id=thread_id):
 
-        try:
-            github = GitHubAdapter()
+        if approval_status == "approved":
 
-            # 1. Generate branch name
-            branch_slug = slugify(user_request_raw) or "feature-update"
-            branch_name = f"feature/{branch_slug}"
+            try:
+                github = GitHubAdapter()
 
-            # 2. Create branch
-            branch_res = github.create_branch(
-                new_branch_name=branch_name
-            )
-            git_result = branch_res
+                # 1. Generate branch name
+                branch_slug = slugify(user_request_raw) or "feature-update"
+                branch_name = f"feature/{branch_slug}"
 
-            # 3. commit_file
-            plan_commit = github.commit_file(
-                file_path = f"docs/devflow-plans/{branch_slug}.md",  # Replace with actual file path
-                commit_message="chore: add DevFlow implementation plan for invoice PDF download",
-                branch_name=branch_name,
-                content=implementation_plan[:8000]
-            )
+                # 2. Create branch
+                branch_res = github.create_branch(
+                    new_branch_name=branch_name
+                )
+                git_result = branch_res
 
-            commit_results.append(f"Plan: {plan_commit}")
-            # 2) Generated code files
-            generated_raw = state.get("generated_code", "")
+                # 3. commit plan file
+                plan_commit = github.commit_file(
+                    file_path=f"docs/devflow-plans/{branch_slug}.md",
+                    commit_message="chore: add DevFlow implementation plan",
+                    branch_name=branch_name,
+                    content=implementation_plan[:8000]
+                )
 
-            if generated_raw:
+                commit_results.append(f"Plan: {plan_commit}")
 
-                files = []
+                # 4. Commit generated code files
+                generated_raw = state.get("generated_code", "")
 
-                # Safe multi-format extraction
-                if hasattr(generated_raw, "files"):
-                    files = generated_raw.files
-                elif hasattr(generated_raw, "model_dump"):
-                    files = generated_raw.model_dump().get("files", [])
-                elif isinstance(generated_raw, dict):
-                    files = generated_raw.get("files", [])
-                elif isinstance(generated_raw, str) and generated_raw.strip():
-                    try:
-                        data = json.loads(generated_raw)
-                        files = data.get("files", [])
-                    except json.JSONDecodeError:
-                        commit_results.append("Invalid JSON string in generated_code")
+                if generated_raw:
 
-                # 2. Iterate and commit files
-                for f in files:
-                    if isinstance(f, dict):
-                        rel_path = str(f.get("path", "")).lstrip("/")
-                        code_content = f.get("content", "")
-                    else:
-                        rel_path = str(getattr(f, "path", "")).lstrip("/")
-                        code_content = getattr(f, "content", "")
+                    files = []
 
-                    if not rel_path or not code_content:
-                        continue
+                    # Safe multi-format extraction
+                    if hasattr(generated_raw, "files"):
+                        files = generated_raw.files
+                    elif hasattr(generated_raw, "model_dump"):
+                        files = generated_raw.model_dump().get("files", [])
+                    elif isinstance(generated_raw, dict):
+                        files = generated_raw.get("files", [])
+                    elif isinstance(generated_raw, str) and generated_raw.strip():
+                        try:
+                            data = json.loads(generated_raw)
+                            files = data.get("files", [])
+                        except json.JSONDecodeError:
+                            commit_results.append("Invalid JSON string in generated_code")
 
-                    repo_path = f"generated/{rel_path}"
+                    # Iterate and commit files
+                    for f in files:
+                        if isinstance(f, dict):
+                            rel_path = str(f.get("path", "")).lstrip("/")
+                            code_content = f.get("content", "")
+                        else:
+                            rel_path = str(getattr(f, "path", "")).lstrip("/")
+                            code_content = getattr(f, "content", "")
 
-                    commit_res = github.commit_file(
-                        file_path=repo_path,
-                        commit_message=f"feat: add suggested {rel_path}",
-                        branch_name=branch_name,
-                        content=code_content,
+                        if not rel_path or not code_content:
+                            continue
+
+                        repo_path = f"generated/{rel_path}"
+
+                        commit_res = github.commit_file(
+                            file_path=repo_path,
+                            commit_message=f"feat: add suggested {rel_path}",
+                            branch_name=branch_name,
+                            content=code_content,
+                        )
+                        commit_results.append(f"{rel_path}: {commit_res}")
+
+                # 5. Create PR only if commits succeeded
+                pr_title = f"feat: {user_request_raw[:50]}"
+
+                pr_body = (
+                    f"### User Request\n"
+                    f"{user_request_raw}\n\n"
+                    f"### Implementation Plan Summary\n"
+                    f"```json\n"
+                    f"{implementation_plan}\n"
+                    f"```\n\n"
+                    f"### Security & Testing\n"
+                    f"Approved via DevFlow AI Workflow."
+                )
+
+                if any(str(c).startswith("Error") for c in commit_results):
+                    pr_result = "Skipped: Commit failed"
+                    final_response = (
+                        "GitHub Automation Failed!\n"
+                        f"- Git Result: {git_result}\n"
+                        f"- Commit Result: {commit_results}\n"
+                        f"- PR Result: {pr_result}"
                     )
-                    commit_results.append(f"{rel_path}: {commit_res}")
+                else:
+                    pr_result = github.create_pull_request(
+                        title=pr_title,
+                        body=pr_body,
+                        head=branch_name,
+                        base="main",
+                    )
+                    final_response = (
+                        "GitHub Automation Completed Successfully!\n"
+                        f"- Branch: {branch_name}\n"
+                        f"- Commits: {commit_results}\n"
+                        f"- PR: {pr_result}"
+                    )
 
-            # 4. Create PR only if branch creation succeeded
-            pr_title = f"feat: {user_request_raw[:50]}"
+            except Exception as e:
 
-            pr_body = (
-                f"### User Request\n"
-                f"{user_request_raw}\n\n"
-                f"### Implementation Plan Summary\n"
-                f"```json\n"
-                f"{implementation_plan}\n"
-                f"```\n\n"
-                f"### Security & Testing\n"
-                f"Approved via DevFlow AI Workflow."
-            )
+                git_result = git_result if git_result != "Skipped" else "Failed"
+                commit_results = commit_results if commit_results else ["Failed"]
+                pr_result = f"Failed: {str(e)}"
 
-            if any(str(c).startswith("Error") for c in commit_results):
-                pr_result = "Skipped: Commit failed"
                 final_response = (
                     "GitHub Automation Failed!\n"
                     f"- Git Result: {git_result}\n"
                     f"- Commit Result: {commit_results}\n"
                     f"- PR Result: {pr_result}"
                 )
-            else:
-                pr_result = github.create_pull_request(
-                    title=pr_title,
-                    body=pr_body,
-                    head=branch_name,
-                    base="main",
-                )
-                final_response = (
-                    "GitHub Automation Completed Successfully!\n"
-                    f"- Branch: {branch_name}\n"
-                    f"- Commits: {commit_results}\n"
-                    f"- PR: {pr_result}"
-                )
 
-        except Exception as e:
-
-            git_result = git_result if git_result != "Skipped" else "Failed"
-            commit_result = commit_results if commit_results else ["Failed"]
-            pr_result = f"Failed: {str(e)}"
+        else:
 
             final_response = (
-                "GitHub Automation Failed!\n"
-                f"- Git Result: {git_result}\n"
-                f"- Commit Result: {commit_result}\n"
-                f"- PR Result: {pr_result}"
+                f"GitHub automation halted "
+                f"(Status: {approval_status}).\n"
+                f"Feedback: {approval_feedback}"
             )
 
-    else:
-
-        final_response = (
-            f"GitHub automation halted "
-            f"(Status: {approval_status}).\n"
-            f"Feedback: {approval_feedback}"
+        # Log event summary
+        log_event(
+            "git_automation_summary",
+            thread_id=thread_id,
+            approval_status=approval_status,
+            branch_name=branch_name,
+            total_commits=len(commit_results),
+            pr_result=pr_result,
+            status="success" if "Successfully" in final_response else "halted_or_failed"
         )
 
     return {
@@ -608,7 +652,6 @@ def git_automation_node(state: DevFlowState) -> dict:
         "final_response": final_response,
         "completed_agents": completed + ["git_automation_node"],
     }
-
 def after_approval_router(state: DevFlowState) -> str:
     status = state.get("approval_status", "pending")
     revision_count = state.get("revision_count", 0)

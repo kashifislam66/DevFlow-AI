@@ -91,13 +91,13 @@ builder.add_node(
 
 builder.add_edge(
     START, 
-    "pdf_extractor_node"
-    )
-
-builder.add_edge(
-    "pdf_extractor_node",
     "supervisor_node"
     )
+
+# builder.add_edge(
+#     "pdf_extractor_node",
+#     "supervisor_node"
+#     )
 
 builder.add_conditional_edges(
     "supervisor_node",
@@ -178,6 +178,7 @@ def run_devflow(user_request: str, thread_id: str = "devflow-1", force_approve: 
     """Run the DevFlow workflow for one request."""
     initial_state = {
         "user_request": user_request,
+        "thread_id": thread_id,
         "messages": [],
         "ast_analysis": "",
         "requirement": "",
@@ -198,6 +199,15 @@ def run_devflow(user_request: str, thread_id: str = "devflow-1", force_approve: 
         "revision_count": 0,
         "git_result": "",
         "pr_result": "",
+    }
+
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "tags": ["devflow", "workflow"],
+        "metadata": {
+            "app": "DevFlow-AI",
+            "source": "api",  # "cli"
+        },
     }
     
     config = {"configurable": {"thread_id": thread_id}}
